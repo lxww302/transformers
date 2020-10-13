@@ -34,6 +34,8 @@ from utils import (
     pickle_save,
     save_git_info,
     use_task_specific_params,
+    MultilingualSeq2SeqTrainDataset,
+    MultilingualSeq2SeqEvalDataset,
 )
 
 
@@ -70,7 +72,7 @@ class SummarizationModule(BaseTransformer):
         self.metrics = defaultdict(list)
         self.model_type = self.config.model_type
         self.vocab_size = self.config.tgt_vocab_size if self.model_type == "fsmt" else self.config.vocab_size
-
+        self.val_dataloader_names = []
         self.dataset_kwargs: dict = dict(
             data_dir=self.hparams.data_dir,
             max_source_length=self.hparams.max_source_length,
@@ -98,10 +100,7 @@ class SummarizationModule(BaseTransformer):
 
         self.hparams.git_sha = get_git_info()["repo_sha"]
         self.num_workers = hparams.num_workers
-        self.decoder_start_token_id = None  # default to config
-        if self.model.config.decoder_start_token_id is None and isinstance(self.tokenizer, MBartTokenizer):
-            self.decoder_start_token_id = self.tokenizer.lang_code_to_id[hparams.tgt_lang]
-            self.model.config.decoder_start_token_id = self.decoder_start_token_id
+
         self.dataset_class = (
             Seq2SeqDataset if hasattr(self.tokenizer, "prepare_seq2seq_batch") else LegacySeq2SeqDataset
         )
@@ -161,32 +160,35 @@ class SummarizationModule(BaseTransformer):
         # TODO(SS): make a wandb summary metric for this
         return {"loss": loss_tensors[0], "log": logs}
 
-    def validation_step(self, batch, batch_idx) -> Dict:
+    def validation_step(self, batch, batch_idx, dataloader_idx=None) -> Dict:
         return self._generative_step(batch)
 
     def validation_epoch_end(self, outputs, prefix="val") -> Dict:
         self.step_count += 1
-        losses = {k: torch.stack([x[k] for x in outputs]).mean() for k in self.loss_names}
-        loss = losses["loss"]
-        generative_metrics = {
-            k: np.array([x[k] for x in outputs]).mean() for k in self.metric_names + ["gen_time", "gen_len"]
-        }
-        metric_val = (
-            generative_metrics[self.val_metric] if self.val_metric in generative_metrics else losses[self.val_metric]
-        )
-        metric_tensor: torch.FloatTensor = torch.tensor(metric_val).type_as(loss)
-        generative_metrics.update({k: v.item() for k, v in losses.items()})
-        losses.update(generative_metrics)
-        all_metrics = {f"{prefix}_avg_{k}": x for k, x in losses.items()}
-        all_metrics["step_count"] = self.step_count
-        self.metrics[prefix].append(all_metrics)  # callback writes this to self.metrics_save_path
-        preds = flatten_list([x["preds"] for x in outputs])
-        return {
-            "log": all_metrics,
-            "preds": preds,
-            f"{prefix}_loss": loss,
-            f"{prefix}_{self.val_metric}": metric_tensor,
-        }
+        eval_results = {}
+        for val_name, output in zip(self.val_dataloader_names, outputs):
+            prefix += val_name
+            losses = {k: torch.stack([x[k] for x in output]).mean() for k in self.loss_names}
+            loss = losses["loss"]
+            generative_metrics = {
+                k: np.array([x[k] for x in output]).mean() for k in self.metric_names + ["gen_time", "gen_len"]
+            }
+            metric_val = (
+                generative_metrics[self.val_metric] if self.val_metric in generative_metrics else losses[self.val_metric]
+            )
+            metric_tensor: torch.FloatTensor = torch.tensor(metric_val).type_as(loss)
+            generative_metrics.update({k: v.item() for k, v in losses.items()})
+            losses.update(generative_metrics)
+            all_metrics = {f"{prefix}_avg_{k}": x for k, x in losses.items()}
+            all_metrics["step_count"] = self.step_count
+            self.metrics[prefix].append(all_metrics)  # callback writes this to self.metrics_save_path
+            preds = flatten_list([x["preds"] for x in output])
+            eval_results[f"{prefix}_log"] = all_metrics
+            eval_results[f"{prefix}_preds"] = preds
+            eval_results[f"{prefix}_loss"] = loss
+            eval_results[f"{prefix}_{self.val_metric}"] = metric_tensor
+
+        return eval_results
 
     def calc_generative_metrics(self, preds, target) -> Dict:
         return calculate_rouge(preds, target)
@@ -199,7 +201,7 @@ class SummarizationModule(BaseTransformer):
             batch["input_ids"],
             attention_mask=batch["attention_mask"],
             use_cache=True,
-            decoder_start_token_id=self.decoder_start_token_id,
+            decoder_start_token_id=batch["decoder_start_token_id"],
             num_beams=self.eval_beams,
             max_length=self.eval_max_length,
         )
@@ -232,6 +234,51 @@ class SummarizationModule(BaseTransformer):
         return dataset
 
     def get_dataloader(self, type_path: str, batch_size: int, shuffle: bool = False) -> DataLoader:
+        if type_path == 'train':
+            dataset = MultilingualSeq2SeqTrainDataset(
+                tokenizer=self.tokenizer,
+                batch_size=batch_size,
+                data_dir=self.hparams.data_dir,
+                max_source_length=self.hparams.max_source_length,
+                max_target_length=self.hparams.max_target_length,
+            )
+            return DataLoader(
+                dataset=dataset,
+                batch_sampler=dataset.batch_sampler(),
+                collate_fn=dataset.collate_fn,
+                num_workers=self.num_workers,
+            )
+        elif type_path == 'val':
+            raw_data = {}
+            data_loaders = []
+            files = [fname for fname in os.listdir(self.hparams.data_dir) if fname.startswith('val.')]
+            for fname in sorted(files):
+                _, lang_pair, lang = fname.split('.')
+                pair = tuple(lang_pair.split('|'))
+                if pair not in raw_data:
+                    raw_data[pair] = [None, None]
+                raw_data[pair][pair.index(lang)] = os.path.join(self.hparams.data_dir, fname)
+            for lang_pair in raw_data:
+                for i in range(2):
+                    self.val_dataloader_names.append(lang_pair[i] + '|' + lang_pair[1 - i])
+                    src_data_dir = raw_data[lang_pair][i]
+                    tgt_data_dir = raw_data[lang_pair][1 - i]
+                    dataset = MultilingualSeq2SeqEvalDataset(
+                        tokenizer=self.tokenizer,
+                        batch_size=batch_size,
+                        src_data_dir=src_data_dir,
+                        tgt_data_dir=tgt_data_dir,
+                        max_source_length=self.hparams.max_source_length,
+                        max_target_length=self.hparams.max_target_length,
+                    )
+                    data_loaders.append(DataLoader(
+                        dataset=dataset,
+                        batch_size=batch_size,
+                        collate_fn=dataset.collate_fn,
+                        shuffle=False,
+                        num_workers=self.num_workers
+                    ))
+            return data_loaders
         dataset = self.get_dataset(type_path)
 
         if self.hparams.sortish_sampler and type_path != "test":
