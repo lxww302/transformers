@@ -105,6 +105,130 @@ def trim_batch(
         return (input_ids[:, keep_column_mask], attention_mask[:, keep_column_mask])
 
 
+class MultilingualSeq2SeqTrainDataset(Dataset):
+    def __init__(
+        self,
+        tokenizer,
+        batch_size,
+        data_dir,
+        max_source_length,
+        max_target_length,
+    ) -> None:
+        super().__init__()
+        self.tokenizer = tokenizer
+        self.batch_size = batch_size
+        self.max_source_length = max_source_length
+        self.max_target_length = max_target_length
+        self.raw_data = {}
+
+        files = [fname for fname in sorted(os.listdir(data_dir)) if fname.startswith('train.')]
+        for fname in files:
+            lines = []
+            with open(os.path.join(data_dir, fname)) as fi:
+                for line in fi:
+                    lines.append(line.strip())
+            _, lang_pair, lang = fname.split('.')
+            pair = tuple(lang_pair.split('|'))
+            if pair not in self.raw_data:
+                self.raw_data[pair] = [None, None]
+            self.raw_data[pair][pair.index(lang)] = lines
+
+        self.all_items = []
+        self.all_pairs = []
+        index = 0
+        for lang_pair in sorted(self.raw_data):
+            for i in range(2):
+                for j, text in enumerate(self.raw_data[lang_pair][i]):
+                    item = {
+                        'src_lang': lang_pair[i],
+                        'tgt_lang': lang_pair[1 - i],
+                        'index': index,
+                        'src_text': text,
+                        'tgt_text': self.raw_data[lang_pair][1 - i][j]
+                    }
+                    index += 1
+                    self.all_items.append(item)
+                    self.all_pairs.append((item['src_lang'], item['tgt_lang']))
+
+    def __getitem__(self, index: int) -> Dict[str, str]:
+        return self.all_items[index]
+
+    def __len__(self):
+        return len(self.all_items)
+
+    def collate_fn(self, batch) -> Dict[str, torch.Tensor]:
+        """Call prepare_seq2seq_batch."""
+        batch_encoding: Dict[str, torch.Tensor] = self.tokenizer.prepare_seq2seq_batch(
+            [x["src_text"] for x in batch],
+            tgt_texts=[x["tgt_text"] for x in batch],
+            max_length=self.max_source_length,
+            max_target_length=self.max_target_length,
+            return_tensors="pt",
+            src_lang=batch[0]['src_lang'],
+            tgt_lang=batch[0]['tgt_lang'],
+        ).data
+        batch_encoding["ids"] = torch.tensor([x["index"] for x in batch])
+        return batch_encoding
+
+    def batch_sampler(self) -> List[List[int]]:
+        """Construct batch indices so that each batch has only one translate direction"""
+        all_directions = set(self.all_pairs)
+        batches = []
+        for direction in all_directions:
+            indices = [i for i, direct in enumerate(self.all_pairs) if direct == direction]
+            np.random.shuffle(indices)
+            for i in range(0, len(indices), self.batch_size):
+                batch = indices[i: i + self.batch_size]
+                batches.append(batch)
+        np.random.shuffle(batches)
+        return batches
+
+
+class MultilingualSeq2SeqEvalDataset(Dataset):
+    def __init__(
+        self,
+        tokenizer,
+        batch_size,
+        src_data_dir,
+        tgt_data_dir,
+        max_source_length,
+        max_target_length,
+    ) -> None:
+        super().__init__()
+        self.tokenizer = tokenizer
+        self.batch_size = batch_size
+        self.max_source_length = max_source_length
+        self.max_target_length = max_target_length
+        self.src_lang = src_data_dir.split('.')[-1]
+        self.tgt_lang = tgt_data_dir.split('.')[-1]
+        self.all_items = []
+        with open(src_data_dir) as fs, open(tgt_data_dir) as ft:
+            for idx, (src_text, tgt_text) in enumerate(zip(fs, ft)):
+                item = {'idx': idx, 'src_text': src_text.strip(), 'tgt_text': tgt_text.strip()}
+                self.all_items.append(item)
+
+    def __getitem__(self, index: int) -> Dict[str, str]:
+        return self.all_items[index]
+
+    def __len__(self):
+        return len(self.all_items)
+
+    def collate_fn(self, batch) -> Dict[str, torch.Tensor]:
+        """Call prepare_seq2seq_batch."""
+        batch_encoding: Dict[str, torch.Tensor] = self.tokenizer.prepare_seq2seq_batch(
+            [x["src_text"] for x in batch],
+            tgt_texts=[x["tgt_text"] for x in batch],
+            max_length=self.max_source_length,
+            max_target_length=self.max_target_length,
+            return_tensors="pt",
+            src_lang=self.src_lang,
+            tgt_lang=self.tgt_lang,
+        ).data
+        batch_encoding["ids"] = torch.tensor([x["idx"] for x in batch])
+        batch_encoding["decoder_start_token_id"] = self.tokenizer.lang_code_to_id[self.tgt_lang]
+        return batch_encoding
+
+
 class AbstractSeq2SeqDataset(Dataset):
     def __init__(
         self,
